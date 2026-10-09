@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install ffmpeg and shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg shellcheck
+      - name: shellcheck
+        run: shellcheck convert2hevc.sh tests/smoke.sh
+      - name: Smoke test (libx265)
+        run: ./tests/smoke.sh

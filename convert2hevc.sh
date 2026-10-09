@@ -2,29 +2,38 @@
 # Convert every video under a directory to HEVC in Matroska, recursively.
 # By Michael Gray
 #
-# Usage: convert2hevc.sh [--software] [--dry-run] [--delete-originals] DIR
+# Usage: convert2hevc.sh [--encoder NAME] [--dry-run] [--delete-originals] DIR
 #
-#   --software          encode with libx265 on the CPU instead of VAAPI
+#   --encoder NAME      auto (default), nvenc, vaapi, qsv or software
+#   --software          same as --encoder software (libx265 on the CPU)
 #   --dry-run           list what would be converted and exit
 #   --delete-originals  remove a source file after its conversion succeeds
 #
+# auto picks the first that works here: NVIDIA NVENC, then VAAPI (AMD and
+# Intel), then Intel Quick Sync, then libx265.
+#
 # Environment:
-#   VAAPI_DEVICE  render node for VAAPI (default /dev/dri/renderD128)
-#   QUALITY       VAAPI -qp / libx265 -crf value (default 20 / 22)
+#   VAAPI_DEVICE  render node for VAAPI and QSV (default /dev/dri/renderD128)
+#   QUALITY       constant-quality value; lower is better and larger
+#                 (defaults: nvenc 24, vaapi 20, qsv 24, software 22)
 #
 # Output is "<name> - HEVC.mkv" beside the source. Audio is copied as-is
 # rather than re-encoded: the old version forced 6-channel Vorbis, which
 # upmixed stereo sources to a fake 5.1 and lost quality on every pass.
 set -euo pipefail
 
-usage() { sed -n '4,13p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '4,20p' "$0" | sed 's/^# \{0,1\}//'; }
 
-encoder=vaapi
+encoder=auto
 dry_run=0
 delete_originals=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --software) encoder=software ;;
+        --encoder)
+            [ $# -ge 2 ] || { echo "--encoder needs a value" >&2; exit 2; }
+            encoder=$2; shift ;;
+        --encoder=*) encoder=${1#--encoder=} ;;
         --dry-run) dry_run=1 ;;
         --delete-originals) delete_originals=1 ;;
         -h|--help) usage; exit 0 ;;
@@ -44,17 +53,55 @@ target=$1
 command -v ffmpeg >/dev/null || { echo "ffmpeg is not installed" >&2; exit 1; }
 
 vaapi_device=${VAAPI_DEVICE:-/dev/dri/renderD128}
-if [ "$encoder" = vaapi ]; then
-    if [ "$dry_run" = 0 ] && [ ! -e "$vaapi_device" ]; then
-        echo "VAAPI device $vaapi_device not found; set VAAPI_DEVICE or use --software" >&2
-        exit 1
-    fi
-    video_args=(-vaapi_device "$vaapi_device" -vf 'format=nv12|vaapi,hwupload'
-                -c:v hevc_vaapi -qp:v "${QUALITY:-20}")
-else
-    video_args=(-c:v libx265 -crf "${QUALITY:-22}" -preset medium
-                -x265-params log-level=error)
-fi
+ffmpeg_encoders=$(ffmpeg -hide_banner -encoders 2>/dev/null || true)
+has_encoder() { grep -q " $1 " <<<"$ffmpeg_encoders"; }
+
+# Whether an encoder can run on this machine, not just whether ffmpeg was
+# built with it: a build lists hevc_nvenc even with no NVIDIA card present.
+usable() {
+    case "$1" in
+        nvenc) has_encoder hevc_nvenc && command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1 ;;
+        vaapi) has_encoder hevc_vaapi && [ -e "$vaapi_device" ] ;;
+        qsv) has_encoder hevc_qsv && [ -e "$vaapi_device" ] ;;
+        software) has_encoder libx265 ;;
+        *) return 1 ;;
+    esac
+}
+
+case "$encoder" in
+    auto)
+        for candidate in nvenc vaapi qsv software; do
+            if usable "$candidate"; then encoder=$candidate; break; fi
+        done
+        if [ "$encoder" = auto ]; then
+            echo "No usable HEVC encoder: this ffmpeg has no libx265 and no working hardware encoder" >&2
+            exit 1
+        fi
+        echo "encoder: $encoder"
+        ;;
+    nvenc|vaapi|qsv|software)
+        if [ "$dry_run" = 0 ] && ! usable "$encoder"; then
+            echo "Encoder '$encoder' is not usable here (missing from ffmpeg, or no device; VAAPI_DEVICE=$vaapi_device)" >&2
+            exit 1
+        fi
+        ;;
+    *) echo "Unknown encoder: $encoder (use auto, nvenc, vaapi, qsv or software)" >&2; exit 2 ;;
+esac
+
+case "$encoder" in
+    nvenc)
+        video_args=(-c:v hevc_nvenc -preset p5 -rc vbr -cq "${QUALITY:-24}" -b:v 0) ;;
+    vaapi)
+        video_args=(-vaapi_device "$vaapi_device" -vf 'format=nv12|vaapi,hwupload'
+                    -c:v hevc_vaapi -qp:v "${QUALITY:-20}") ;;
+    qsv)
+        video_args=(-init_hw_device "qsv=hw:$vaapi_device" -filter_hw_device hw
+                    -vf 'format=nv12,hwupload=extra_hw_frames=64'
+                    -c:v hevc_qsv -global_quality "${QUALITY:-24}") ;;
+    software)
+        video_args=(-c:v libx265 -crf "${QUALITY:-22}" -preset medium
+                    -x265-params log-level=error) ;;
+esac
 
 converted=0
 skipped=0
